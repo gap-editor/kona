@@ -1,230 +1,212 @@
-//! Contains an online derivation pipeline.
+//! Contains an online implementation of the `BeaconClient` trait.
 
-use crate::{AlloyChainProvider, AlloyL2ChainProvider, OnlineBeaconClient, OnlineBlobProvider};
+#[cfg(feature = "metrics")]
+use crate::Metrics;
+use crate::blobs::BoxedBlobWithIndex;
+use alloy_eips::eip4844::IndexedBlobHash;
+use alloy_rpc_types_beacon::sidecar::{BeaconBlobBundle, GetBlobsResponse};
 use async_trait::async_trait;
-use core::fmt::Debug;
-use kona_derive::{
-    DerivationPipeline, EthereumDataSource, IndexedAttributesQueueStage, L2ChainProvider,
-    OriginProvider, Pipeline, PipelineBuilder, PipelineErrorKind, PipelineResult,
-    PolledAttributesQueueStage, ResetSignal, Signal, SignalReceiver, StatefulAttributesBuilder,
-    StepResult,
-};
-use kona_genesis::{L1ChainConfig, RollupConfig, SystemConfig};
-use kona_protocol::{BlockInfo, L2BlockInfo, OpAttributesWithParent};
-use std::sync::Arc;
+use reqwest::Client;
+use std::{boxed::Box, format, string::String, vec::Vec};
 
-/// An online polled derivation pipeline.
-type OnlinePolledDerivationPipeline = DerivationPipeline<
-    PolledAttributesQueueStage<
-        OnlineDataProvider,
-        AlloyChainProvider,
-        AlloyL2ChainProvider,
-        OnlineAttributesBuilder,
-    >,
-    AlloyL2ChainProvider,
->;
+/// The config spec engine api method.
+const SPEC_METHOD: &str = "eth/v1/config/spec";
 
-/// An online managed derivation pipeline.
-type OnlineManagedDerivationPipeline = DerivationPipeline<
-    IndexedAttributesQueueStage<
-        OnlineDataProvider,
-        AlloyChainProvider,
-        AlloyL2ChainProvider,
-        OnlineAttributesBuilder,
-    >,
-    AlloyL2ChainProvider,
->;
+/// The beacon genesis engine api method.
+const GENESIS_METHOD: &str = "eth/v1/beacon/genesis";
 
-/// An RPC-backed Ethereum data source.
-type OnlineDataProvider =
-    EthereumDataSource<AlloyChainProvider, OnlineBlobProvider<OnlineBeaconClient>>;
+/// The blob sidecars engine api method prefix.
+const SIDECARS_METHOD_PREFIX_DEPRECATED: &str = "eth/v1/beacon/blob_sidecars";
 
-/// An RPC-backed payload attributes builder for the `AttributesQueue` stage of the derivation
-/// pipeline.
-type OnlineAttributesBuilder = StatefulAttributesBuilder<AlloyChainProvider, AlloyL2ChainProvider>;
+/// THe blobs engine api method prefix.
+const BLOBS_METHOD_PREFIX: &str = "eth/v1/beacon/blobs";
 
-/// An online derivation pipeline.
-#[derive(Debug)]
-pub enum OnlinePipeline {
-    /// An online derivation pipeline that uses a polled traversal stage.
-    Polled(OnlinePolledDerivationPipeline),
-    /// An online derivation pipeline that uses a managed traversal stage.
-    Managed(OnlineManagedDerivationPipeline),
+/// A reduced genesis data.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReducedGenesisData {
+    /// The genesis time.
+    #[serde(rename = "genesis_time")]
+    #[serde(with = "alloy_serde::quantity")]
+    pub genesis_time: u64,
 }
 
-impl OnlinePipeline {
-    /// Constructs a new polled derivation pipeline that is initialized.
-    pub async fn new(
-        cfg: Arc<RollupConfig>,
-        l1_cfg: Arc<L1ChainConfig>,
-        l2_safe_head: L2BlockInfo,
-        l1_origin: BlockInfo,
-        blob_provider: OnlineBlobProvider<OnlineBeaconClient>,
-        chain_provider: AlloyChainProvider,
-        mut l2_chain_provider: AlloyL2ChainProvider,
-    ) -> PipelineResult<Self> {
-        let mut pipeline = Self::new_polled(
-            cfg.clone(),
-            l1_cfg.clone(),
-            blob_provider,
-            chain_provider,
-            l2_chain_provider.clone(),
-        );
+/// An API genesis response.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct APIGenesisResponse {
+    /// The data.
+    pub data: ReducedGenesisData,
+}
 
-        // Reset the pipeline to populate the initial L1/L2 cursor and system configuration in L1
-        // Traversal.
-        pipeline
-            .signal(
-                ResetSignal {
-                    l2_safe_head,
-                    l1_origin,
-                    system_config: l2_chain_provider
-                        .system_config_by_number(l2_safe_head.block_info.number, cfg.clone())
-                        .await
-                        .ok(),
+/// A reduced config data.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReducedConfigData {
+    /// The seconds per slot.
+    #[serde(rename = "SECONDS_PER_SLOT")]
+    #[serde(with = "alloy_serde::quantity")]
+    pub seconds_per_slot: u64,
+}
+
+/// An API config response.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct APIConfigResponse {
+    /// The data.
+    pub data: ReducedConfigData,
+}
+
+impl APIConfigResponse {
+    /// Creates a new API config response.
+    pub const fn new(seconds_per_slot: u64) -> Self {
+        Self { data: ReducedConfigData { seconds_per_slot } }
+    }
+}
+
+impl APIGenesisResponse {
+    /// Creates a new API genesis response.
+    pub const fn new(genesis_time: u64) -> Self {
+        Self { data: ReducedGenesisData { genesis_time } }
+    }
+}
+
+/// The [BeaconClient] is a thin wrapper around the Beacon API.
+#[async_trait]
+pub trait BeaconClient {
+    /// The error type for [BeaconClient] implementations.
+    type Error: core::fmt::Display;
+
+    /// Returns the config spec.
+    async fn config_spec(&self) -> Result<APIConfigResponse, Self::Error>;
+
+    /// Returns the beacon genesis.
+    async fn beacon_genesis(&self) -> Result<APIGenesisResponse, Self::Error>;
+
+    /// Fetches blobs that were confirmed in the specified L1 block with the given slot.
+    /// Blob data is not checked for validity.
+    async fn filtered_beacon_blobs(
+        &self,
+        slot: u64,
+        blob_hashes: &[IndexedBlobHash],
+    ) -> Result<Vec<BoxedBlobWithIndex>, Self::Error>;
+}
+
+/// An online implementation of the [BeaconClient] trait.
+#[derive(Debug, Clone)]
+pub struct OnlineBeaconClient {
+    /// The base URL of the beacon API.
+    pub base: String,
+    /// The inner reqwest client.
+    pub inner: Client,
+}
+
+impl OnlineBeaconClient {
+    /// Creates a new [OnlineBeaconClient] from the provided base URL string.
+    pub fn new_http(mut base: String) -> Self {
+        // If base ends with a slash, remove it
+        if base.ends_with("/") {
+            base.remove(base.len() - 1);
+        }
+        Self { base, inner: Client::builder().build().expect("Failed to create beacon client") }
+    }
+
+    async fn filtered_beacon_blobs(
+        &self,
+        slot: u64,
+        blob_hashes: &[IndexedBlobHash],
+    ) -> Result<Vec<BoxedBlobWithIndex>, reqwest::Error> {
+        let blob_indexes = blob_hashes.iter().map(|blob| blob.index).collect::<Vec<_>>();
+
+        Ok(
+            match self
+                .inner
+                .get(format!("{}/{}/{}", self.base, BLOBS_METHOD_PREFIX, slot))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    let bundle = response.json::<GetBlobsResponse>().await?;
+
+                    bundle
+                        .data
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, blob)| {
+                            let index = index as u64;
+                            blob_indexes
+                                .contains(&index)
+                                .then_some(BoxedBlobWithIndex { index, blob: Box::new(blob) })
+                        })
+                        .collect::<Vec<_>>()
                 }
-                .signal(),
-            )
-            .await?;
-
-        Ok(pipeline)
-    }
-
-    /// Constructs a new polled derivation pipeline that is uninitialized.
-    ///
-    /// Uses online providers as specified by the arguments.
-    ///
-    /// Before using the returned pipeline, a [`ResetSignal`] must be sent to
-    /// instantiate the pipeline state. [`Self::new`] is a convenience method that
-    /// constructs a new online pipeline and sends the reset signal.
-    pub fn new_polled(
-        cfg: Arc<RollupConfig>,
-        l1_cfg: Arc<L1ChainConfig>,
-        blob_provider: OnlineBlobProvider<OnlineBeaconClient>,
-        chain_provider: AlloyChainProvider,
-        l2_chain_provider: AlloyL2ChainProvider,
-    ) -> Self {
-        let attributes = StatefulAttributesBuilder::new(
-            cfg.clone(),
-            l1_cfg,
-            l2_chain_provider.clone(),
-            chain_provider.clone(),
-        );
-        let dap = EthereumDataSource::new_from_parts(chain_provider.clone(), blob_provider, &cfg);
-
-        let pipeline = PipelineBuilder::new()
-            .rollup_config(cfg)
-            .dap_source(dap)
-            .l2_chain_provider(l2_chain_provider)
-            .chain_provider(chain_provider)
-            .builder(attributes)
-            .origin(BlockInfo::default())
-            .build_polled();
-
-        Self::Polled(pipeline)
-    }
-
-    /// Constructs a new indexed derivation pipeline that is uninitialized.
-    ///
-    /// Uses online providers as specified by the arguments.
-    ///
-    /// Before using the returned pipeline, a [`ResetSignal`] must be sent to
-    /// instantiate the pipeline state. [`Self::new`] is a convenience method that
-    /// constructs a new online pipeline and sends the reset signal.
-    pub fn new_indexed(
-        cfg: Arc<RollupConfig>,
-        l1_cfg: Arc<L1ChainConfig>,
-        blob_provider: OnlineBlobProvider<OnlineBeaconClient>,
-        chain_provider: AlloyChainProvider,
-        l2_chain_provider: AlloyL2ChainProvider,
-    ) -> Self {
-        let attributes = StatefulAttributesBuilder::new(
-            cfg.clone(),
-            l1_cfg,
-            l2_chain_provider.clone(),
-            chain_provider.clone(),
-        );
-        let dap = EthereumDataSource::new_from_parts(chain_provider.clone(), blob_provider, &cfg);
-
-        let pipeline = PipelineBuilder::new()
-            .rollup_config(cfg)
-            .dap_source(dap)
-            .l2_chain_provider(l2_chain_provider)
-            .chain_provider(chain_provider)
-            .builder(attributes)
-            .origin(BlockInfo::default())
-            .build_indexed();
-
-        Self::Managed(pipeline)
+                // If the blobs endpoint fails, try the deprecated sidecars endpoint. CL Clients
+                // only support the blobs endpoint from Fusaka (Fulu) onwards.
+                _ => self
+                    .inner
+                    .get(format!("{}/{}/{}", self.base, SIDECARS_METHOD_PREFIX_DEPRECATED, slot))
+                    .send()
+                    .await?
+                    .json::<BeaconBlobBundle>()
+                    .await?
+                    .into_iter()
+                    .filter_map(|blob| {
+                        blob_indexes
+                            .contains(&blob.index)
+                            .then_some(BoxedBlobWithIndex { index: blob.index, blob: blob.blob })
+                    })
+                    .collect::<Vec<_>>(),
+            },
+        )
     }
 }
 
 #[async_trait]
-impl SignalReceiver for OnlinePipeline {
-    /// Receives a signal from the driver.
-    async fn signal(&mut self, signal: Signal) -> PipelineResult<()> {
-        match self {
-            Self::Polled(pipeline) => pipeline.signal(signal).await,
-            Self::Managed(pipeline) => pipeline.signal(signal).await,
-        }
-    }
-}
+impl BeaconClient for OnlineBeaconClient {
+    type Error = reqwest::Error;
 
-impl OriginProvider for OnlinePipeline {
-    /// Returns the optional L1 [BlockInfo] origin.
-    fn origin(&self) -> Option<BlockInfo> {
-        match self {
-            Self::Polled(pipeline) => pipeline.origin(),
-            Self::Managed(pipeline) => pipeline.origin(),
-        }
-    }
-}
+    async fn config_spec(&self) -> Result<APIConfigResponse, Self::Error> {
+        kona_macros::inc!(gauge, Metrics::BEACON_CLIENT_REQUESTS, "method" => "spec");
 
-impl Iterator for OnlinePipeline {
-    type Item = OpAttributesWithParent;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Polled(pipeline) => pipeline.next(),
-            Self::Managed(pipeline) => pipeline.next(),
+        let result = async {
+            let first = self.inner.get(format!("{}/{}", self.base, SPEC_METHOD)).send().await?;
+            first.json::<APIConfigResponse>().await
         }
-    }
-}
+        .await;
 
-#[async_trait]
-impl Pipeline for OnlinePipeline {
-    /// Peeks at the next [OpAttributesWithParent] from the pipeline.
-    fn peek(&self) -> Option<&OpAttributesWithParent> {
-        match self {
-            Self::Polled(pipeline) => pipeline.peek(),
-            Self::Managed(pipeline) => pipeline.peek(),
+        if result.is_err() {
+            kona_macros::inc!(gauge, Metrics::BEACON_CLIENT_ERRORS, "method" => "spec");
         }
+
+        result
     }
 
-    /// Attempts to progress the pipeline.
-    async fn step(&mut self, cursor: L2BlockInfo) -> StepResult {
-        match self {
-            Self::Polled(pipeline) => pipeline.step(cursor).await,
-            Self::Managed(pipeline) => pipeline.step(cursor).await,
+    async fn beacon_genesis(&self) -> Result<APIGenesisResponse, Self::Error> {
+        kona_macros::inc!(gauge, Metrics::BEACON_CLIENT_REQUESTS, "method" => "genesis");
+
+        let result = async {
+            let first = self.inner.get(format!("{}/{}", self.base, GENESIS_METHOD)).send().await?;
+            first.json::<APIGenesisResponse>().await
         }
+        .await;
+
+        if result.is_err() {
+            kona_macros::inc!(gauge, Metrics::BEACON_CLIENT_ERRORS, "method" => "genesis");
+        }
+
+        result
     }
 
-    /// Returns the rollup config.
-    fn rollup_config(&self) -> &RollupConfig {
-        match self {
-            Self::Polled(pipeline) => pipeline.rollup_config(),
-            Self::Managed(pipeline) => pipeline.rollup_config(),
-        }
-    }
+    async fn filtered_beacon_blobs(
+        &self,
+        slot: u64,
+        blob_hashes: &[IndexedBlobHash],
+    ) -> Result<Vec<BoxedBlobWithIndex>, Self::Error> {
+        kona_macros::inc!(gauge, Metrics::BEACON_CLIENT_REQUESTS, "method" => "blobs");
 
-    /// Returns the [SystemConfig] by L2 number.
-    async fn system_config_by_number(
-        &mut self,
-        number: u64,
-    ) -> Result<SystemConfig, PipelineErrorKind> {
-        match self {
-            Self::Polled(pipeline) => pipeline.system_config_by_number(number).await,
-            Self::Managed(pipeline) => pipeline.system_config_by_number(number).await,
+        // Try to get the blobs from the blobs endpoint.
+        let result = self.filtered_beacon_blobs(slot, blob_hashes).await;
+
+        if result.is_err() {
+            kona_macros::inc!(gauge, Metrics::BEACON_CLIENT_ERRORS, "method" => "blobs");
         }
+
+        result
     }
 }
